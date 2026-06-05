@@ -23,7 +23,9 @@ public class Obfuscator implements Expr.Visitor<Expr>, Stmt.Visitor<Stmt>{
         nameMap.put("close", "close");
         nameMap.put("read", "read");
         nameMap.put("write", "write");
+        nameMap.put("append", "append");
         nameMap.put("str", "str");
+        nameMap.put("round", "round");
     }
 
     List<Stmt> obfuscate(List<Stmt> statements){
@@ -47,6 +49,12 @@ public class Obfuscator implements Expr.Visitor<Expr>, Stmt.Visitor<Stmt>{
 
     private Expr transform(Expr expr){
         return expr.accept(this);
+    }
+
+    public Stmt visitClassStmt(Stmt.Class stmt){
+        String newName = obfuscateName(stmt.name.lexeme);
+        Token newToken = new Token(stmt.name.type, newName, null, stmt.name.line);
+        return new Stmt.Class(newToken, stmt.methods);
     }
 
     public Stmt visitBlockStmt(Stmt.Block stmt){
@@ -175,6 +183,10 @@ public class Obfuscator implements Expr.Visitor<Expr>, Stmt.Visitor<Stmt>{
     }
 
     private Expr obfuscateNumber(double value) {
+        if (value != (long) value){
+            return new Expr.Literal(value);
+        }
+        
         int strategy = random.nextInt(2);
         
         if (strategy == 0) {

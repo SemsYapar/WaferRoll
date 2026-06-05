@@ -2,11 +2,9 @@ package waferroll;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -17,8 +15,7 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
     final Environment globals = new Environment();
     private Environment environment = globals;
     private final Map<Expr, Integer> locals = new HashMap<>();
-    public final Map<Integer, FileInputStream> readHandles = new HashMap<>();
-    public final Map<Integer, FileOutputStream> writeHandles = new HashMap<>();
+    public final Map<Integer, RandomAccessFile> handles = new HashMap<>();
     public int nextHandle = 0;
     
     Interpreter(){
@@ -47,8 +44,7 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
                     if (line == null) return null;
                     return line;
                 } catch (IOException e) {
-                    System.err.println("getline error: " + e.getMessage());
-                    return null;
+                    return -2.0;
                 }
             }
 
@@ -62,7 +58,7 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
 
             @Override
             public Object call(Interpreter interpreter, List<Object> arguments){
-                System.out.println(arguments.get(0));
+                System.out.println(stringify(arguments.get(0)));
                 return null;
             }
 
@@ -76,7 +72,7 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
 
             @Override
             public Object call(Interpreter interpreter, List<Object> arguments){
-                System.out.print(arguments.get(0));
+                System.out.print(stringify(arguments.get(0)));
                 return null;
             }
 
@@ -106,20 +102,30 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
                 }
 
                 try {
-                    interpreter.readHandles.put(id, new FileInputStream(resolvedPath));
-                } catch (FileNotFoundException e) {
-                    interpreter.nextHandle--;
+                    File f = new File(resolvedPath);
+                    if (!f.exists()) f.createNewFile();
+                } catch (IOException e){
                     return -2.0;
-                } catch (SecurityException e) {
-                    interpreter.nextHandle--;
-                    return -3.0;
                 }
 
+                RandomAccessFile raf = null;
                 try {
-                    interpreter.writeHandles.put(id, new FileOutputStream(resolvedPath, false));
-                } catch (SecurityException ignored) {}
-                catch (IOException ignored) {}
-
+                    raf = new RandomAccessFile(resolvedPath, "rw");
+                } catch (IOException e) {
+                    String msg = e.getMessage();
+                    if (msg != null && (msg.contains("Access is denied") || msg.contains("Permission denied"))) {
+                        try {
+                            raf = new RandomAccessFile(resolvedPath, "r");
+                        } catch (IOException e2) {
+                            interpreter.nextHandle--;
+                            return -4.0;
+                        }
+                    } else {
+                        interpreter.nextHandle--;
+                        return -3.0;
+                    }
+                }      
+                interpreter.handles.put(id, raf);
                 return (double) id;
             }
 
@@ -134,20 +140,12 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
             @Override
             public Object call(Interpreter interpreter, List<Object> arguments) {
                 int id = (int)(double) arguments.get(0);
-
-                if (!interpreter.readHandles.containsKey(id) && !interpreter.writeHandles.containsKey(id)) {
+                if (!interpreter.handles.containsKey(id)) return -1.0;
+                try {
+                    interpreter.handles.remove(id).close();
+                } catch (IOException e) {
                     return -1.0;
                 }
-
-                try {
-                    FileInputStream in = interpreter.readHandles.remove(id);
-                    if (in != null) in.close();
-                    FileOutputStream out = interpreter.writeHandles.remove(id);
-                    if (out != null) out.close();
-                } catch (IOException e) {
-                    System.err.println("close error: " + e.getMessage());
-                }
-
                 return null;
             }
 
@@ -155,32 +153,28 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
             public String toString() { return "<native fn close>"; }
         });
 
-        globals.define("read", new LoxCallable() {
-            @Override
-            public int arity() { return 1; }
+    globals.define("read", new LoxCallable() {
+        @Override
+        public int arity() { return 1; }
 
-            @Override
-            public Object call(Interpreter interpreter, List<Object> arguments) {
-                int id = (int)(double) arguments.get(0);
-
-                if (!interpreter.readHandles.containsKey(id)) {
-                    return -1.0;
-                }
-
-                FileInputStream in = interpreter.readHandles.get(id);
-                try {
-                    byte[] bytes = in.readAllBytes();
-                    if (bytes.length == 0) return null;
-                    return new String(bytes);
-                } catch (IOException e) {
-                    System.err.println("read error: " + e.getMessage());
-                    return -1.0;
-                }
+        @Override
+        public Object call(Interpreter interpreter, List<Object> arguments) {
+            int id = (int)(double) arguments.get(0);
+            if (!interpreter.handles.containsKey(id)) return -1.0;
+            try {
+                RandomAccessFile raf = interpreter.handles.get(id);
+                raf.seek(0);
+                byte[] bytes = new byte[(int) raf.length()];
+                raf.readFully(bytes);
+                return new String(bytes);
+            } catch (IOException e) {
+                return -1.0;
             }
+        }
 
-            @Override
-            public String toString() { return "<native fn read>"; }
-        });
+        @Override
+        public String toString() { return "<native fn read>"; }
+    });
 
         globals.define("write", new LoxCallable() {
             @Override
@@ -189,21 +183,16 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
             @Override
             public Object call(Interpreter interpreter, List<Object> arguments) {
                 int id = (int)(double) arguments.get(0);
-
-                if (!interpreter.writeHandles.containsKey(id)) {
-                    return -1.0;
-                }
-
+                if (!interpreter.handles.containsKey(id)) return -1.0;
                 String data = arguments.get(1).toString();
-                FileOutputStream out = interpreter.writeHandles.get(id);
                 try {
-                    out.write(data.getBytes());
-                    out.flush();
+                    RandomAccessFile raf = interpreter.handles.get(id);
+                    raf.seek(0);
+                    raf.setLength(0);
+                    raf.writeBytes(data);
                 } catch (IOException e) {
-                    System.err.println("write error: " + e.getMessage());
                     return -1.0;
                 }
-
                 return null;
             }
 
@@ -211,6 +200,28 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
             public String toString() { return "<native fn write>"; }
         });
  
+        globals.define("append", new LoxCallable() {
+            @Override
+            public int arity() { return 2; }
+
+            @Override
+            public Object call(Interpreter interpreter, List<Object> arguments) {
+                int id = (int)(double) arguments.get(0);
+                if (!interpreter.handles.containsKey(id)) return -1.0;
+                String data = arguments.get(1).toString();
+                try {
+                    RandomAccessFile raf = interpreter.handles.get(id);
+                    raf.seek(raf.length());
+                    raf.writeBytes(data);
+                } catch (IOException e) {
+                    return -1.0;
+                }
+                return null;
+            }
+
+            @Override
+            public String toString() { return "<native fn append>"; }
+        });
         globals.define("str", new LoxCallable() {
             @Override
             public int arity() { return 1; }
@@ -218,19 +229,34 @@ public class Interpreter implements Expr.Visitor<Object>, Stmt.Visitor<Void>{
             @Override
             public Object call(Interpreter interpreter, List<Object> arguments) {
                 Object value = arguments.get(0);
-                if (value == null) return "nil";
-                if (value instanceof Boolean) return value.toString();
-                if (value instanceof Double) {
-                    double d = (double) value;
-                    if (d == (long) d) return String.valueOf((long) d);
-                    return String.valueOf(d);
-                }
-                return value.toString();
+                return stringify(value);
             }
 
             @Override
             public String toString() { return "<native fn>"; }
         });
+
+        globals.define("round", new LoxCallable() {
+            @Override
+            public int arity() { return 1; }
+
+            @Override
+            public Object call(Interpreter interpreter, List<Object> arguments) {
+                double d = (double) arguments.get(0);
+                return (double) Math.round(d);
+            }
+
+            @Override
+            public String toString() { return "<native fn round>"; }
+        });
+    }
+
+    @Override
+    public Void visitClassStmt(Stmt.Class stmt){
+        environment.define(stmt.name.lexeme, null);
+        LoxClass klass = new LoxClass(stmt.name.lexeme);
+        environment.assign(stmt.name, klass);
+        return null;
     }
 
     @Override
